@@ -276,6 +276,7 @@ def tolk_pdf(pdf: bytes, startaar: int, feilsok_navn: str | None = None):
     linjer = pdf_til_linjer(pdf)
     if feilsok_navn:
         FEILSOK.mkdir(exist_ok=True)
+        (FEILSOK / f"{feilsok_navn}.pdf").write_bytes(pdf)
         (FEILSOK / f"{feilsok_navn}.txt").write_text("\n".join(linjer), encoding="utf-8")
     dager, merknader = tolk_linjer(linjer, startaar)
     return avgrens_kirkeaar(dager, startaar), merknader
