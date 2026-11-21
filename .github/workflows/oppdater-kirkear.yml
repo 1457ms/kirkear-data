@@ -27,9 +27,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -41,12 +41,13 @@ jobs:
 
       - name: Hent og tolk Kirkens kalender
         id: hent
-        run: python scripts/hent_kirkear.py
+        run: python scripts/hent_kirkear.py 2>&1 | tee hent.log; exit ${PIPESTATUS[0]}
 
       - name: Lagre endringer
         # Lagrer også når ett av årene feilet, så lenge filen ble skrevet (gode år beholdes).
         if: always() && steps.hent.outcome != 'skipped'
         run: |
+          if [ ! -f data/kirkear.json ]; then echo "Ingen datafil å lagre."; exit 0; fi
           git config user.name  "kirkear-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/kirkear.json
@@ -57,10 +58,17 @@ jobs:
             git push
           fi
 
-      - name: Last opp tekstutdrag for feilsøking
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: feilsok
-          path: feilsok/
-          retention-days: 30
+      - name: Lagre feilsøkingsdata i grenen «feilsok»
+        # Teksten fra Kirkens offentlige PDF-er + logg, så feilen kan rettes uten innlogging.
+        if: failure() && steps.hent.outcome == 'failure'
+        run: |
+          mkdir -p /tmp/fs && cp -r feilsok/. /tmp/fs/ 2>/dev/null || true
+          cp hent.log /tmp/fs/ 2>/dev/null || true
+          git config user.name  "kirkear-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan feilsok
+          git rm -rq --cached . && git clean -fdq -e feilsok
+          rm -rf feilsok && cp -r /tmp/fs feilsok
+          git add -f feilsok
+          git commit -qm "Feilsøkingsdata $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -f origin feilsok
