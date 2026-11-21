@@ -18,6 +18,7 @@ Bruk:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import datetime as dt
 import io
 import json
@@ -55,10 +56,6 @@ _VERS = r"[0-9]+[a-d]?(?:\s?[–—-]\s?[0-9]+(?:,[0-9]+)?[a-d]?)?(?:\.[0-9]+[a-
 _KAP = rf"[0-9]+(?:,\s?{_VERS})?"
 REF = rf"(?:[1-5]\s?)?[A-ZÆØÅ][A-Za-zæøåÆØÅ]{{0,12}}\.?\s{_KAP}(?:\s?;\s?{_KAP})*"
 
-LESNING_RE = re.compile(rf"^(?:(?P<rekke>III|II|I|A)\s*)?(?P<ref>{REF})(?:\s+(?P<tittel>\S.*))?$")
-REKKE_ALENE_RE = re.compile(r"^(III|II|I|A)$")
-ELLER_RE = re.compile(r"^eller\b", re.I)
-SIDEHODE_RE = re.compile(r"^\[?Utskrift|Kirkeårets tekster \d{4}\s*[-–]\s*\d{4}|^side \d+$|^\d+$", re.I)
 _MND = "|".join(MANEDER)
 OVERSKRIFT_RE = re.compile(
     rf"^(?P<navn>\S.*?)\s+[–—-]\s+(?P<resten>[A-Za-zÆØÅæøå].*?(?P<dag>\d{{1,2}})\.\s*(?P<mnd>{_MND})(?:\s+(?P<aar>\d{{4}}))?)\s*$",
@@ -119,73 +116,96 @@ def _velg_aar(dag: int, mnd: int, forrige: dt.date | None, startaar: int) -> dt.
     return min(gyldige or kandidater, key=lambda d: abs((d - forrige).days))
 
 
-def tolk_linjer(linjer: list[str], startaar: int) -> tuple[list[Dag], list[str]]:
-    """Gjør tekstlinjer fra én kalender-PDF om til en liste med dager."""
+BOK_RE = re.compile(r"^(?:[1-5]\s?)?[A-ZÆØÅ][A-Za-zæøåÆØÅ]{0,12}\.?\s\d")
+ALT_RE = re.compile(r"^(eller|og)\b\s*", re.I)
+
+
+def _lag_dag(tekst: str, forrige: dt.date | None, startaar: int, merknader: list[str]) -> Dag | None:
+    tekst = rens(tekst)
+    m = OVERSKRIFT_RE.match(tekst)
+    if not m:
+        return None
+    navn = re.sub(r"\s*/\s*", "/", rens(m.group("navn")))
+    dag, mnd = int(m.group("dag")), MANEDER[m.group("mnd").lower()]
+    try:
+        if m.group("aar"):
+            dato = dt.date(int(m.group("aar")), mnd, dag)
+        else:
+            dato = _velg_aar(dag, mnd, forrige, startaar)
+    except ValueError:
+        merknader.append(f"Ugyldig dato i overskrift: {tekst}")
+        return None
+    # Trykkfeil i kilden: «Søndag 27. september 2028» er en onsdag -> nærmeste søndag.
+    if m.group("resten").lower().startswith("søndag") and "/" not in m.group("resten") and dato.weekday() != 6:
+        forskyvning = 6 - dato.weekday() if dato.weekday() >= 3 else -(dato.weekday() + 1)
+        rettet = dato + dt.timedelta(days=forskyvning)
+        merknader.append(f"Rettet trykkfeil i kilden: {navn} står som søndag {dato}, men det er ikke en søndag. Bruker {rettet}.")
+        dato = rettet
+    return Dag(dato=dato, navn=navn)
+
+
+def tolk_rader(rader: list[dict], startaar: int) -> tuple[list[Dag], list[str]]:
+    """
+    Bygger dager av rader fra PDF-en. Hver rad er enten
+      {"type": "overskrift", "tekst": ...} eller
+      {"type": "tekst", "rekke": ..., "ref": ..., "tittel": ...}
+    der kolonnene allerede er skilt fra hverandre (se pdf_til_rader).
+    """
     dager: list[Dag] = []
     merknader: list[str] = []
-    ventende: list[str] = []      # linjer som kan være starten på et navn
     gjeldende: Dag | None = None
-    ventende_rekke = ""
-    eller = False
     forrige_dato: dt.date | None = None
+    alt_neste = False
+    siste: dict | None = None  # siste lesning, for fortsettelseslinjer
 
-    for ra in linjer:
-        linje = rens(ra)
-        if not linje or SIDEHODE_RE.search(linje):
+    for rad in rader:
+        if rad["type"] == "overskrift":
+            gjeldende = _lag_dag(rad["tekst"], forrige_dato, startaar, merknader)
+            if gjeldende:
+                dager.append(gjeldende)
+                forrige_dato = gjeldende.dato
+            alt_neste, siste = False, None
+            continue
+        if gjeldende is None:
             continue
 
-        m = OVERSKRIFT_RE.match(linje)
-        if m:
-            navn = m.group("navn")
-            # Navn brutt over to linjer: «Vingårdssøndag/14. søndag i» + «treenighetstiden – …»
-            if ventende and (navn[:1].islower() or ventende[-1].endswith(("/", " i", " og", "-"))):
-                navn = ventende[-1] + " " + navn
-            navn = rens(navn)
-            dag, mnd = int(m.group("dag")), MANEDER[m.group("mnd").lower()]
-            try:
-                if m.group("aar"):
-                    dato = dt.date(int(m.group("aar")), mnd, dag)
-                else:
-                    dato = _velg_aar(dag, mnd, forrige_dato, startaar)
-            except ValueError:
-                merknader.append(f"Ugyldig dato i overskrift: {linje}")
-                ventende = []
-                continue
-            gjeldende = Dag(dato=dato, navn=navn)
-            dager.append(gjeldende)
-            forrige_dato = dato
-            ventende, ventende_rekke, eller = [], "", False
+        rekke = rad.get("rekke", "")
+        ref = rens(rad.get("ref", ""))
+        tittel = rens(rad.get("tittel", ""))
+        er_alt = alt_neste
+        a = ALT_RE.match(ref)
+        if a:
+            er_alt, ref = True, ref[a.end():]
+        if rekke in ("eller", "og"):
+            er_alt, rekke = True, ""
+
+        if not ref and not tittel:
+            alt_neste = er_alt
+            continue
+        alt_neste = False
+
+        if ref and not BOK_RE.match(ref + " 0") and siste is not None and not rekke:
+            # Fortsettelse av forrige henvisning, f.eks. «2 Mos 1,22–» + «2,10».
+            skille = "" if siste["ref"].endswith(("–", "-", ";", ",", ".")) else " "
+            siste["ref"] = rens(siste["ref"] + skille + ref)
+            if tittel:
+                siste["title"] = rens(siste["title"] + " " + tittel)
+            continue
+        if not ref:
+            if siste is not None:
+                siste["title"] = rens(siste["title"] + " " + tittel)
             continue
 
-        if gjeldende is not None:
-            if REKKE_ALENE_RE.match(linje):
-                ventende_rekke = linje
-                continue
-            if ELLER_RE.match(linje):
-                eller = True
-                continue
-            lm = LESNING_RE.match(linje)
-            if lm:
-                rekke = lm.group("rekke") or ventende_rekke
-                if rekke and not gjeldende.rekke:
-                    gjeldende.rekke = rekke
-                ventende_rekke = ""
-                post = {"ref": rens(lm.group("ref")), "title": rens(lm.group("tittel") or "")}
-                if eller and gjeldende.lesninger:
-                    gjeldende.lesninger[-1].setdefault("alt", []).append(post)
-                elif len(gjeldende.lesninger) < 3:
-                    gjeldende.lesninger.append(post)
-                else:
-                    gjeldende.ekstra.append(post)
-                eller = False
-                ventende = []
-                continue
-
-        # Ukjent linje: kan være første del av et navn som er brutt over to linjer.
-        if len(linje) <= 60 and not linje.endswith((".", ":")):
-            ventende.append(linje)
+        if rekke in ("I", "II", "III", "A") and not gjeldende.rekke:
+            gjeldende.rekke = rekke
+        post = {"ref": ref, "title": tittel}
+        if er_alt and gjeldende.lesninger:
+            gjeldende.lesninger[-1].setdefault("alt", []).append(post)
+        elif len(gjeldende.lesninger) < 3:
+            gjeldende.lesninger.append(post)
         else:
-            ventende = []
+            gjeldende.ekstra.append(post)
+        siste = post
     return dager, merknader
 
 
@@ -262,7 +282,57 @@ def finn_pdf_adresser(idag: dt.date) -> dict[int, str]:
     return adresser
 
 
+def pdf_til_rader(pdf: bytes) -> list[dict]:
+    """
+    Leser PDF-en ord for ord. Hver side har to spalter, og hver spalte har faste
+    kolonner: rekke, bibelhenvisning og tittel. Overskrifter er i fet skrift.
+    """
+    import pdfplumber
+
+    rader: list[dict] = []
+    with pdfplumber.open(io.BytesIO(pdf)) as dok:
+        for side in dok.pages:
+            ord_ = [w for w in side.extract_words(extra_attrs=["fontname"], keep_blank_chars=False)
+                    if "Italic" in w["fontname"] or "Bold" in w["fontname"]]
+            midt = side.width / 2
+            for spalte in (
+                [w for w in ord_ if w["x0"] < midt],
+                [w for w in ord_ if w["x0"] >= midt],
+            ):
+                if not spalte:
+                    continue
+                linjer: list[list[dict]] = []
+                for w in sorted(spalte, key=lambda w: (w["top"], w["x0"])):
+                    if linjer and abs(linjer[-1][0]["top"] - w["top"]) < 2.5:
+                        linjer[-1].append(w)
+                    else:
+                        linjer.append([w])
+                # Venstre kant i spalten = der overskriftene starter (vanligst blant fete linjer).
+                starter = [round(min(w["x0"] for w in l)) for l in linjer if all("Bold" in w["fontname"] for w in l)]
+                kant = Counter(starter).most_common(1)[0][0] if starter else min(w["x0"] for w in spalte)
+                forrige_fet = False
+                for linje in linjer:
+                    linje.sort(key=lambda w: w["x0"])
+                    fet = all("Bold" in w["fontname"] for w in linje)
+                    tekst = " ".join(w["text"] for w in linje)
+                    if fet:
+                        if forrige_fet and rader:
+                            rader[-1]["tekst"] += " " + tekst
+                        else:
+                            rader.append({"type": "overskrift", "tekst": tekst})
+                        forrige_fet = True
+                        continue
+                    forrige_fet = False
+                    celler = {"rekke": [], "ref": [], "tittel": []}
+                    for w in linje:
+                        rel = w["x0"] - kant
+                        celler["rekke" if rel < 18 else "ref" if rel < 88 else "tittel"].append(w["text"])
+                    rader.append({"type": "tekst", **{k: " ".join(v) for k, v in celler.items()}})
+    return rader
+
+
 def pdf_til_linjer(pdf: bytes) -> list[str]:
+    """Ren tekst (bare til feilsøking)."""
     import pdfplumber
 
     linjer: list[str] = []
@@ -273,12 +343,12 @@ def pdf_til_linjer(pdf: bytes) -> list[str]:
 
 
 def tolk_pdf(pdf: bytes, startaar: int, feilsok_navn: str | None = None):
-    linjer = pdf_til_linjer(pdf)
+    rader = pdf_til_rader(pdf)
     if feilsok_navn:
         FEILSOK.mkdir(exist_ok=True)
         (FEILSOK / f"{feilsok_navn}.pdf").write_bytes(pdf)
-        (FEILSOK / f"{feilsok_navn}.txt").write_text("\n".join(linjer), encoding="utf-8")
-    dager, merknader = tolk_linjer(linjer, startaar)
+        (FEILSOK / f"{feilsok_navn}.json").write_text(json.dumps(rader, ensure_ascii=False, indent=0), encoding="utf-8")
+    dager, merknader = tolk_rader(rader, startaar)
     return avgrens_kirkeaar(dager, startaar), merknader
 
 
